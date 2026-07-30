@@ -333,13 +333,35 @@ function setNav(name) {
   }
 }
 
+var toastHideTimer = null;
 function toast(msg, undoable) {
   var t = document.getElementById('toast');
+  var bar = document.getElementById('toastBar');
   document.getElementById('toastMsg').textContent = msg;
   document.getElementById('toastUndo').hidden = !undoable;
-  t.hidden = false;
+
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(function () { t.hidden = true; }, 5200);
+  if (toastHideTimer) clearTimeout(toastHideTimer);
+
+  t.hidden = false;
+  t.classList.remove('show');
+  bar.style.animation = 'none';
+  void bar.offsetWidth; /* restart the drain bar when a toast fires again before the last one finished */
+  bar.style.animation = '';
+  requestAnimationFrame(function () { t.classList.add('show'); });
+
+  toastTimer = setTimeout(function () {
+    t.classList.remove('show');
+    toastHideTimer = setTimeout(function () { t.hidden = true; }, 170);
+  }, 5200);
+}
+
+function hideToast() {
+  if (toastTimer) clearTimeout(toastTimer);
+  if (toastHideTimer) clearTimeout(toastHideTimer);
+  var t = document.getElementById('toast');
+  t.classList.remove('show');
+  t.hidden = true;
 }
 
 /* ---------------- views ---------------- */
@@ -1167,7 +1189,7 @@ function undo() {
     setStatus(lastChange.id, lastChange.prev, false);
   }
   lastChange = null;
-  document.getElementById('toast').hidden = true;
+  hideToast();
   route();
   paintPlate();
 }

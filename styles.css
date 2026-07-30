@@ -894,20 +894,50 @@ html[data-theme="light"] .chip[aria-pressed="true"] {
 
 .toast {
   position: fixed;
-  left: var(--pad);
-  right: var(--pad);
-  bottom: calc(var(--dock-h) + env(safe-area-inset-bottom) + 12px);
+  left: 0;
+  right: 0;
+  bottom: calc(var(--dock-h) + env(safe-area-inset-bottom));
   z-index: 50;
-  background: var(--steel-700);
-  border: 1px solid var(--line-strong);
-  border-left: 4px solid var(--caution);
-  padding: 12px 14px;
+  background: var(--steel-750);
+  border-top: 1px solid var(--line-strong);
+  padding: 12px var(--pad) 15px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   font-size: 13.5px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  transform: translateY(6px);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform 160ms ease, opacity 160ms ease;
+}
+.toast.show {
+  transform: translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast { transition: none; }
+}
+.toast-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--caution);
+  transform: scaleX(1);
+  transform-origin: left;
+}
+.toast.show .toast-bar {
+  animation: toast-drain 5.2s linear forwards;
+}
+@keyframes toast-drain {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast-bar { animation: none; display: none; }
 }
 .toast-undo {
   flex: none;
