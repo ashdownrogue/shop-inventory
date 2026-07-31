@@ -1,3 +1,10 @@
 node_modules/
 .DS_Store
 *.log
+
+# Never commit the Neon connection string or the auth secrets.
+# `vercel env pull` writes .env.local; seed-db.js reads DATABASE_URL.
+.env
+.env.*
+!.env.example
+.vercel/
