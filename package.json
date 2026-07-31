@@ -2,12 +2,16 @@
   "name": "shop-inventory",
   "version": "1.0.0",
   "private": true,
-  "description": "Local-first garage shop inventory audit. Static, offline-capable, no build step.",
+  "description": "Local-first garage shop inventory audit. Static frontend, no build step; optional Postgres-backed sync API under /api.",
   "scripts": {
     "start": "python3 -m http.server 8899",
-    "test": "node tests/smoke.js"
+    "test": "node tests/smoke.js",
+    "seed-db": "node scripts/seed-db.js"
   },
   "devDependencies": {
     "jsdom": "^26.1.0"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0"
   }
 }

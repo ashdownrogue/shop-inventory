@@ -19,11 +19,15 @@ var seed = null;
 var index = {};        /* id -> { item, sec, sub } */
 var flat = [];         /* ordered list of index entries */
 var user = {};         /* id -> { s, q, sp, n, c, u } */
-var prefs = { theme: 'dark', wake: false, group: 'priority' };
-var ui = { filter: 'all', query: '', collapsed: {}, open: null };
-var lastChange = null;
+var prefs = { theme: 'dark', wake: false, group: 'priority', syncEnabled: false };
+var ui = { filter: 'all', query: '', collapsed: {}, open: null, editMode: false };
+var undoStack = [];
+var UNDO_MAX = 50;
+var renameOriginal = new Map(); /* el -> value at focus time, for one undo entry per edit session */
 var toastTimer = null;
 var wakeSentinel = null;
+var sync = { syncing: false, lastSyncedAt: null, loggedIn: false, error: null };
+var syncPushTimer = null;
 
 /* ---------------- checklist parser ----------------
    The deployment ships the canonical markdown checklist and parses it here,
@@ -162,6 +166,258 @@ function parseChecklist(text) {
   return { version: 1, generated: '2026-07-29', totalItems: total, sections: out };
 }
 
+/* ---------------- checklist editing ----------------
+   Once synced, the checklist is no longer a read-only parse of
+   data/checklist.md -- it's mutable local state that mirrors it. Every
+   mutation stamps updatedAt, which doubles as the "this needs to sync"
+   marker (see collectChanged in the sync module) and drives last-write-
+   wins merges against the server. Deletes are soft: cascaded onto
+   children so a deleted section/subsection's items are consistently
+   filtered everywhere without checking ancestry at render time. */
+
+function newId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function touchEntity(obj) {
+  obj.updatedAt = new Date().toISOString();
+  return obj;
+}
+
+function findSection(id) {
+  for (var i = 0; i < seed.sections.length; i++) {
+    if (seed.sections[i].id === id) return seed.sections[i];
+  }
+  return null;
+}
+
+function findSubsection(id) {
+  for (var i = 0; i < seed.sections.length; i++) {
+    var subs = seed.sections[i].subsections;
+    for (var j = 0; j < subs.length; j++) {
+      if (subs[j].id === id) return { sub: subs[j], sec: seed.sections[i] };
+    }
+  }
+  return null;
+}
+
+function createItem(subId, opts, record) {
+  var found = findSubsection(subId);
+  if (!found) return null;
+  var it = touchEntity({
+    id: newId(), label: opts.label, qty: !!opts.qty,
+    target: opts.qty && opts.target ? opts.target : null,
+    spec: !!opts.spec, phase: typeof opts.phase === 'number' ? opts.phase : null,
+    tags: [], store: classifyStore(opts.label, found.sec.title), deleted: false
+  });
+  found.sub.items.push(it);
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'create', entityKind: 'item', id: it.id });
+  return it;
+}
+
+function createSubsection(secId, title, record) {
+  var sec = findSection(secId);
+  if (!sec) return null;
+  var num = sec.num + '.' + (sec.subsections.length + 1);
+  var sub = touchEntity({ id: newId(), num: num, title: title, items: [], deleted: false });
+  sec.subsections.push(sub);
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'create', entityKind: 'subsection', id: sub.id });
+  return sub;
+}
+
+function createSection(title, record) {
+  var maxNum = 0;
+  for (var i = 0; i < seed.sections.length; i++) maxNum = Math.max(maxNum, seed.sections[i].num);
+  var sec = touchEntity({ id: newId(), num: maxNum + 1, title: title, subsections: [], deleted: false });
+  seed.sections.push(sec);
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'create', entityKind: 'section', id: sec.id });
+  return sec;
+}
+
+function renameEntity(kind, id, newLabel, record) {
+  var obj = null;
+  if (kind === 'item') obj = index[id] && index[id].item;
+  else if (kind === 'subsection') { var f = findSubsection(id); obj = f && f.sub; }
+  else if (kind === 'section') obj = findSection(id);
+  if (!obj || !newLabel) return;
+  var prev = kind === 'item' ? obj.label : obj.title;
+  if (prev === newLabel) return;
+  if (kind === 'item') obj.label = newLabel; else obj.title = newLabel;
+  touchEntity(obj);
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'rename', entityKind: kind, id: id, prev: prev });
+}
+
+// Delete/undelete are two sides of the same soft-delete cascade: sections
+// cascade onto their subsections and items, subsections onto their items.
+// Undoing a parent delete/undelete replays the identical cascade in
+// reverse, which can resurrect a child that had been independently
+// deleted first -- an accepted edge case given how rarely it'd occur.
+function setDeletedCascade(kind, id, val) {
+  if (kind === 'item') {
+    var entry = findItemAnywhere(id);
+    if (!entry) return false;
+    entry.deleted = val;
+    touchEntity(entry);
+  } else if (kind === 'subsection') {
+    var f = findSubsection(id);
+    if (!f) return false;
+    f.sub.deleted = val;
+    touchEntity(f.sub);
+    for (var i = 0; i < f.sub.items.length; i++) { f.sub.items[i].deleted = val; touchEntity(f.sub.items[i]); }
+  } else if (kind === 'section') {
+    var sec = findSection(id);
+    if (!sec) return false;
+    sec.deleted = val;
+    touchEntity(sec);
+    for (var j = 0; j < sec.subsections.length; j++) {
+      sec.subsections[j].deleted = val;
+      touchEntity(sec.subsections[j]);
+      for (var k = 0; k < sec.subsections[j].items.length; k++) {
+        sec.subsections[j].items[k].deleted = val;
+        touchEntity(sec.subsections[j].items[k]);
+      }
+    }
+  }
+  return true;
+}
+
+// Items can be deleted (so absent from `index`/`flat`), so lookups that
+// need to reach a possibly-already-deleted item search the raw seed tree.
+function findItemAnywhere(id) {
+  if (index[id]) return index[id].item;
+  for (var i = 0; i < seed.sections.length; i++) {
+    var subs = seed.sections[i].subsections;
+    for (var j = 0; j < subs.length; j++) {
+      var items = subs[j].items;
+      for (var k = 0; k < items.length; k++) {
+        if (items[k].id === id) return items[k];
+      }
+    }
+  }
+  return null;
+}
+
+function deleteEntity(kind, id, record) {
+  if (!setDeletedCascade(kind, id, true)) return;
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'delete', entityKind: kind, id: id });
+}
+
+function undeleteEntity(kind, id, record) {
+  if (!setDeletedCascade(kind, id, false)) return;
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'create', entityKind: kind, id: id });
+}
+
+function moveEntity(kind, id, dir, record) {
+  var list = null, i = -1;
+  if (kind === 'item') {
+    var e = index[id];
+    if (!e) return;
+    list = e.sub.items;
+  } else if (kind === 'subsection') {
+    var f = findSubsection(id);
+    if (!f) return;
+    list = f.sec.subsections;
+  } else if (kind === 'section') {
+    list = seed.sections;
+  }
+  for (var j = 0; j < list.length; j++) { if (list[j].id === id) { i = j; break; } }
+  var ni = i + dir;
+  if (i < 0 || ni < 0 || ni >= list.length) return;
+  var tmp = list[i]; list[i] = list[ni]; list[ni] = tmp;
+  touchEntity(list[i]); touchEntity(list[ni]);
+  buildIndex();
+  queueSyncPush();
+  if (record !== false) pushUndo({ kind: 'move', entityKind: kind, id: id, dir: dir });
+}
+
+/* ---------------- undo ----------------
+   A real stack, not a single slot: every recordable mutation (status,
+   bulk mark, qty, create/delete/rename/move) pushes an entry describing
+   its own inverse. Undo pops and replays inverses one at a time --
+   classic Ctrl+Z, repeatable back through the whole session, not tied to
+   a toast that vanishes after a few seconds. Free-text fields (note,
+   spec, cost) are intentionally not on the stack; the browser's native
+   field-level undo already covers those, and per-keystroke entries here
+   would flood it. */
+
+function pushUndo(entry) {
+  undoStack.push(entry);
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  renderUndoBadge();
+}
+
+function labelFor(kind, id) {
+  if (kind === 'item') { var it = findItemAnywhere(id); return it ? it.label : 'item'; }
+  if (kind === 'subsection') { var f = findSubsection(id); return f ? f.sub.title : 'subsection'; }
+  if (kind === 'section') { var s = findSection(id); return s ? s.title : 'section'; }
+  return id;
+}
+
+function describeUndo(entry) {
+  switch (entry.kind) {
+    case 'status': return 'status: ' + shortLabel(entry.id);
+    case 'bulk': return entry.ids.length + ' marked Have';
+    case 'qty': return 'quantity: ' + shortLabel(entry.id);
+    case 'create': return 'added ' + entry.entityKind + ': ' + labelFor(entry.entityKind, entry.id);
+    case 'delete': return 'deleted ' + entry.entityKind + ': ' + labelFor(entry.entityKind, entry.id);
+    case 'rename': return 'renamed ' + entry.entityKind;
+    case 'move': return 'reordered ' + entry.entityKind;
+    default: return 'change';
+  }
+}
+
+function applyInverse(entry) {
+  if (entry.kind === 'status') {
+    setStatus(entry.id, entry.prev, false);
+  } else if (entry.kind === 'bulk') {
+    for (var i = 0; i < entry.ids.length; i++) setStatus(entry.ids[i], 'unknown', false);
+  } else if (entry.kind === 'qty') {
+    var r = touch(entry.id);
+    if (entry.prev === null) delete r.q; else r.q = entry.prev;
+    persist();
+  } else if (entry.kind === 'create') {
+    deleteEntity(entry.entityKind, entry.id, false);
+  } else if (entry.kind === 'delete') {
+    undeleteEntity(entry.entityKind, entry.id, false);
+  } else if (entry.kind === 'rename') {
+    renameEntity(entry.entityKind, entry.id, entry.prev, false);
+  } else if (entry.kind === 'move') {
+    moveEntity(entry.entityKind, entry.id, -entry.dir, false);
+  }
+}
+
+function performUndo() {
+  var entry = undoStack.pop();
+  if (!entry) return;
+  var msg = describeUndo(entry);
+  applyInverse(entry);
+  renderUndoBadge();
+  hideToast();
+  route();
+  paintPlate();
+  toast('Undone: ' + msg, undoStack.length > 0);
+}
+
+function renderUndoBadge() {
+  var btn = document.getElementById('undoBtn');
+  if (!btn) return;
+  btn.hidden = undoStack.length === 0;
+  var count = document.getElementById('undoCount');
+  if (count) count.textContent = String(undoStack.length);
+}
+
 /* ---------------- storage ---------------- */
 
 function openDb() {
@@ -203,10 +459,14 @@ var saveTimer = null;
 function persist() {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(function () {
-    var payload = { user: user, prefs: prefs, savedAt: new Date().toISOString() };
+    var payload = {
+      user: user, prefs: prefs, seed: seed, lastSyncedAt: sync.lastSyncedAt,
+      savedAt: new Date().toISOString()
+    };
     idbSet(KEY, payload)['catch'](function () {
       try { localStorage.setItem(KEY, JSON.stringify(payload)); } catch (e) { /* full */ }
     });
+    if (prefs.syncEnabled) queueSyncPush();
   }, 180);
 }
 
@@ -214,6 +474,201 @@ function loadSaved() {
   return idbGet(KEY)['catch'](function () {
     try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { return null; }
   });
+}
+
+/* ---------------- sync ----------------
+   POST /api/sync pushes whatever local content/marks changed since the
+   last successful sync and pulls back whatever changed server-side
+   (including other devices), merged by the same last-write-wins-on-
+   updatedAt rule the JSON import/export already uses. Silently no-ops
+   to local-only behavior when sync isn't enabled or the network/session
+   isn't available -- the app must keep working exactly as it does today
+   for anyone who never sets a passphrase. */
+
+function collectChanged(sinceIso) {
+  var sections = [], subsections = [], items = [];
+  for (var si = 0; si < seed.sections.length; si++) {
+    var sec = seed.sections[si];
+    if (sec.updatedAt && (!sinceIso || sec.updatedAt > sinceIso)) {
+      sections.push({ id: sec.id, num: sec.num, title: sec.title, sortOrder: si,
+        deleted: !!sec.deleted, updatedAt: sec.updatedAt });
+    }
+    for (var bi = 0; bi < sec.subsections.length; bi++) {
+      var sub = sec.subsections[bi];
+      if (sub.updatedAt && (!sinceIso || sub.updatedAt > sinceIso)) {
+        subsections.push({ id: sub.id, sectionId: sec.id, num: sub.num, title: sub.title,
+          sortOrder: bi, deleted: !!sub.deleted, updatedAt: sub.updatedAt });
+      }
+      for (var ii = 0; ii < sub.items.length; ii++) {
+        var it = sub.items[ii];
+        if (it.updatedAt && (!sinceIso || it.updatedAt > sinceIso)) {
+          items.push({ id: it.id, subsectionId: sub.id, label: it.label, qty: !!it.qty,
+            target: it.target, spec: !!it.spec, phase: it.phase, tags: it.tags || [],
+            store: it.store, sortOrder: ii, deleted: !!it.deleted, updatedAt: it.updatedAt });
+        }
+      }
+    }
+  }
+  var marks = [];
+  for (var id in user) {
+    if (!Object.prototype.hasOwnProperty.call(user, id)) continue;
+    var r = user[id];
+    if (r.u && (!sinceIso || r.u > sinceIso)) {
+      marks.push({ itemId: id, status: r.s || null, q: typeof r.q === 'number' ? r.q : null,
+        sp: r.sp || null, n: r.n || null, c: typeof r.c === 'number' ? r.c : null, updatedAt: r.u });
+    }
+  }
+  return { sections: sections, subsections: subsections, items: items, marks: marks };
+}
+
+function newer(a, b) { return !a || (b && b > a); }
+
+function mergeSectionRow(row) {
+  var sec = findSection(row.id);
+  if (sec && !newer(sec.updatedAt, row.updatedAt)) return;
+  if (!sec) {
+    sec = { id: row.id, num: row.num, title: row.title, subsections: [] };
+    seed.sections.push(sec);
+  }
+  sec.num = row.num; sec.title = row.title; sec.deleted = row.deleted;
+  sec.updatedAt = row.updatedAt; sec.sortOrder = row.sortOrder;
+}
+
+function mergeSubsectionRow(row) {
+  var parent = findSection(row.sectionId);
+  if (!parent) return;
+  var f = findSubsection(row.id);
+  var sub = f && f.sub;
+  if (sub && !newer(sub.updatedAt, row.updatedAt)) return;
+  if (!sub) {
+    sub = { id: row.id, num: row.num, title: row.title, items: [] };
+    parent.subsections.push(sub);
+  }
+  sub.num = row.num; sub.title = row.title; sub.deleted = row.deleted;
+  sub.updatedAt = row.updatedAt; sub.sortOrder = row.sortOrder;
+}
+
+function mergeItemRow(row) {
+  var f = findSubsection(row.subsectionId);
+  if (!f) return;
+  var existing = null;
+  for (var i = 0; i < f.sub.items.length; i++) {
+    if (f.sub.items[i].id === row.id) { existing = f.sub.items[i]; break; }
+  }
+  if (existing && !newer(existing.updatedAt, row.updatedAt)) return;
+  if (!existing) {
+    existing = { id: row.id };
+    f.sub.items.push(existing);
+  }
+  existing.label = row.label; existing.qty = row.qty; existing.target = row.target;
+  existing.spec = row.spec; existing.phase = row.phase; existing.tags = row.tags || [];
+  existing.store = row.store; existing.deleted = row.deleted;
+  existing.updatedAt = row.updatedAt; existing.sortOrder = row.sortOrder;
+}
+
+function mergeMarkRow(row) {
+  var a = user[row.itemId];
+  if (a && a.u && !newer(a.u, row.updatedAt)) return;
+  var r = { u: row.updatedAt };
+  if (row.status) r.s = row.status;
+  if (typeof row.q === 'number') r.q = row.q;
+  if (row.sp) r.sp = row.sp;
+  if (row.n) r.n = row.n;
+  if (typeof row.c === 'number') r.c = row.c;
+  if (r.s || typeof r.q === 'number' || r.sp || r.n || typeof r.c === 'number') user[row.itemId] = r;
+  else delete user[row.itemId];
+}
+
+function bySortOrder(a, b) { return (a.sortOrder || 0) - (b.sortOrder || 0); }
+
+function applyServerState(state) {
+  var i;
+  for (i = 0; i < state.sections.length; i++) mergeSectionRow(state.sections[i]);
+  for (i = 0; i < state.subsections.length; i++) mergeSubsectionRow(state.subsections[i]);
+  for (i = 0; i < state.items.length; i++) mergeItemRow(state.items[i]);
+  for (i = 0; i < state.marks.length; i++) mergeMarkRow(state.marks[i]);
+
+  seed.sections.sort(bySortOrder);
+  for (i = 0; i < seed.sections.length; i++) {
+    seed.sections[i].subsections.sort(bySortOrder);
+    for (var j = 0; j < seed.sections[i].subsections.length; j++) {
+      seed.sections[i].subsections[j].items.sort(bySortOrder);
+    }
+  }
+  buildIndex();
+}
+
+function syncNow() {
+  if (!prefs.syncEnabled || sync.syncing) return;
+  sync.syncing = true;
+  var body = collectChanged(sync.lastSyncedAt);
+  body.since = sync.lastSyncedAt;
+  fetch('/api/sync', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    if (r.status === 401) { sync.loggedIn = false; sync.error = 'signed out'; return null; }
+    if (!r.ok) throw new Error('sync ' + r.status);
+    return r.json();
+  }).then(function (resp) {
+    sync.syncing = false;
+    if (!resp) return;
+    sync.loggedIn = true; sync.error = null;
+    applyServerState(resp);
+    sync.lastSyncedAt = resp.now;
+    persist();
+    var s2 = currentSection();
+    if (s2) renderList(s2);
+    paintPlate();
+    renderSyncDot();
+  })['catch'](function (err) {
+    sync.syncing = false;
+    sync.error = 'offline';
+    renderSyncDot();
+  });
+}
+
+function queueSyncPush() {
+  if (!prefs.syncEnabled) return;
+  if (syncPushTimer) clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(syncNow, 500);
+}
+
+function syncLogin(passphrase) {
+  return fetch('/api/auth/login', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ passphrase: passphrase })
+  }).then(function (r) {
+    if (!r.ok) throw new Error('wrong passphrase');
+    prefs.syncEnabled = true;
+    sync.loggedIn = true; sync.error = null;
+    sync.lastSyncedAt = null; /* first sync after login pulls everything */
+    persist();
+    syncNow();
+    return true;
+  });
+}
+
+function syncLogout() {
+  fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' })['catch'](function () {});
+  prefs.syncEnabled = false;
+  sync.loggedIn = false;
+  persist();
+  renderSyncDot();
+}
+
+function renderSyncDot() {
+  var el = document.getElementById('syncDot');
+  if (!el) return;
+  if (!prefs.syncEnabled) { el.hidden = true; return; }
+  el.hidden = false;
+  el.className = 'sync-dot ' +
+    (sync.error ? 'sync-dot-error' : sync.syncing ? 'sync-dot-busy' : 'sync-dot-ok');
+  el.title = sync.error ? 'Sync: ' + sync.error :
+    sync.syncing ? 'Syncing…' :
+    sync.lastSyncedAt ? 'Synced ' + new Date(sync.lastSyncedAt).toLocaleTimeString() : 'Not synced yet';
 }
 
 /* ---------------- helpers ---------------- */
@@ -237,10 +692,21 @@ function touch(id) {
 function setStatus(id, s, remember) {
   var prev = statusOf(id);
   if (prev === s) return prev;
-  if (remember !== false) lastChange = { id: id, prev: prev };
+  if (remember !== false) pushUndo({ kind: 'status', id: id, prev: prev });
   var r = touch(id);
   if (s === 'unknown') { delete r.s; } else { r.s = s; }
-  if (!r.s && !r.q && !r.sp && !r.n && typeof r.c !== 'number') delete user[id];
+  /* An emptied record is kept as a bare { u } tombstone rather than
+     deleted outright. collectChanged() walks `user`, so a deleted key is
+     simply invisible to sync and the cleared mark would never propagate
+     -- the stale value would sit on the server and resurrect on the next
+     device that pulls with an older cursor. A tombstone reads identically
+     to "absent" everywhere (statusOf/qtyOf/rec all handle it) but does
+     get pushed, and mergeMarkRow() drops the record on the receiving end.
+     Note `typeof r.q !== 'number'`, not `!r.q`: a counted zero is real
+     data (it's what puts a consumable on the buy list), not an empty. */
+  if (!r.s && typeof r.q !== 'number' && !r.sp && !r.n && typeof r.c !== 'number') {
+    user[id] = { u: r.u };
+  }
   persist();
   return prev;
 }
@@ -281,8 +747,10 @@ function stats() {
 function sectionStats(sec) {
   var o = { total: 0, have: 0, gap: 0, na: 0, unknown: 0 };
   for (var i = 0; i < sec.subsections.length; i++) {
+    if (sec.subsections[i].deleted) continue;
     var items = sec.subsections[i].items;
     for (var j = 0; j < items.length; j++) {
+      if (items[j].deleted) continue;
       o.total++;
       var st = statusOf(items[j].id);
       if (st === 'have') o.have++;
@@ -395,6 +863,7 @@ function viewIndex() {
   h += '<div class="wrap"><div class="eyebrow">Sections</div></div>';
   h += '<div class="sec-list" id="secList">';
   for (var i = 0; i < seed.sections.length; i++) {
+    if (seed.sections[i].deleted) continue;
     var sec = seed.sections[i], o = sectionStats(sec);
     h += '<a class="sec-row" href="#/s/' + sec.id + '">' +
       '<span class="sec-num">' + (sec.num < 10 ? '0' : '') + sec.num + '</span>' +
@@ -473,7 +942,7 @@ function viewSection(secId) {
   for (var i = 0; i < seed.sections.length; i++) {
     if (seed.sections[i].id === secId || seed.sections[i].id === 's' + secId) sec = seed.sections[i];
   }
-  if (!sec) { location.hash = '#/'; return; }
+  if (!sec || sec.deleted) { location.hash = '#/'; return; }
 
   var o = sectionStats(sec);
   var h = '';
@@ -482,7 +951,9 @@ function viewSection(secId) {
     '<a class="back" href="#/" aria-label="Back to index">\u2039</a>' +
     '<span class="toolbar-title"><span class="t">' + esc(sec.title) + '</span>' +
     '<span class="m">Section ' + sec.num + ' \u00b7 ' + o.have + '/' + o.total + ' have \u00b7 ' +
-    o.unknown + ' left</span></span></div>' +
+    o.unknown + ' left</span></span>' +
+    '<button type="button" class="edit-toggle" data-act="edit-toggle" aria-pressed="' + ui.editMode +
+    '">' + (ui.editMode ? 'Done' : 'Edit') + '</button></div>' +
     '<input class="search" id="secSearch" type="search" inputmode="search" placeholder="Filter this section\u2026" value="' + esc(ui.query) + '">' +
     '<div class="chips">' +
     chip('all', 'All') + chip('unaudited', 'Not audited') + chip('gaps', 'Gaps') +
@@ -522,19 +993,22 @@ function renderList(sec) {
 
   for (var i = 0; i < sec.subsections.length; i++) {
     var sub = sec.subsections[i];
+    if (sub.deleted) continue;
     var visible = [];
     for (var j = 0; j < sub.items.length; j++) {
+      if (sub.items[j].deleted) continue;
       var entry = index[sub.items[j].id];
       if (q && entry.item.label.toLowerCase().indexOf(q) < 0) continue;
       if (!passesFilter(entry)) continue;
       visible.push(entry);
     }
-    if (!visible.length) continue;
+    if (!visible.length && !ui.editMode) continue;
     shown += visible.length;
 
     var collapsed = !!ui.collapsed[sub.id];
     var so = { total: 0, have: 0, gap: 0, na: 0 };
     for (var k = 0; k < sub.items.length; k++) {
+      if (sub.items[k].deleted) continue;
       so.total++;
       var st = statusOf(sub.items[k].id);
       if (st === 'have') so.have++; else if (st === 'na') so.na++; else if (GAPS[st]) so.gap++;
@@ -547,20 +1021,50 @@ function renderList(sec) {
       '<span class="subsec-count">' + so.have + '/' + so.total + '</span>' +
       '<span class="subsec-caret">' + (collapsed ? '\u25b8' : '\u25be') + '</span></button>';
 
+    if (ui.editMode) h += editRow('subsection', sub.id, i, sec.subsections.length);
+
     if (!collapsed) {
       if (so.have + so.gap + so.na < so.total) {
         h += '<button type="button" class="bulk" data-act="bulk" data-sub="' + sub.id + '">' +
           '+ Mark remaining ' + (so.total - so.have - so.gap - so.na) + ' in ' + esc(sub.num) + ' as Have</button>';
       }
       for (var m = 0; m < visible.length; m++) h += itemHtml(visible[m], false);
+      if (ui.editMode) h += addItemForm(sub.id);
     }
     h += '</section>';
   }
 
-  if (!shown) {
+  if (ui.editMode) h += addSubsectionForm(sec.id);
+
+  if (!shown && !ui.editMode) {
     h = '<div class="empty"><strong>Nothing matches</strong>Clear the filter or the search to see the rest of this section.</div>';
   }
   document.getElementById('list').innerHTML = h;
+}
+
+function editRow(kind, id, i, len) {
+  return '<div class="edit-row">' +
+    '<button type="button" class="edit-btn" data-act="move" data-kind="' + kind + '" data-id="' + id +
+    '" data-dir="-1"' + (i === 0 ? ' disabled' : '') + '>\u2191</button>' +
+    '<button type="button" class="edit-btn" data-act="move" data-kind="' + kind + '" data-id="' + id +
+    '" data-dir="1"' + (i === len - 1 ? ' disabled' : '') + '>\u2193</button>' +
+    '<button type="button" class="edit-btn edit-btn-danger" data-act="delete-entity" data-kind="' + kind +
+    '" data-id="' + id + '">Delete</button></div>';
+}
+
+function addItemForm(subId) {
+  return '<div class="add-row" data-sub="' + subId + '">' +
+    '<input class="field-in add-label" type="text" placeholder="New item label\u2026">' +
+    '<label class="add-check"><input type="checkbox" class="add-qty"> count</label>' +
+    '<input class="field-in add-target" type="number" min="0" placeholder="want N+">' +
+    '<label class="add-check"><input type="checkbox" class="add-spec"> spec field</label>' +
+    '<button type="button" class="btn" data-act="add-item" data-sub="' + subId + '">+ Add item</button></div>';
+}
+
+function addSubsectionForm(secId) {
+  return '<div class="add-row" data-sec="' + secId + '">' +
+    '<input class="field-in add-sub-title" type="text" placeholder="New subsection title\u2026">' +
+    '<button type="button" class="btn" data-act="add-sub" data-sec="' + secId + '">+ Add subsection</button></div>';
 }
 
 function itemHtml(entry, showSection) {
@@ -593,12 +1097,23 @@ function itemHtml(entry, showSection) {
   var h = '<div class="item" data-status="' + st + '" data-item="' + it.id + '">' +
     '<div class="item-row">' +
     '<button type="button" class="status" data-act="cycle" data-id="' + it.id + '" data-s="' + st +
-    '" aria-label="' + esc(it.label + ': ' + SLABEL[st] + '. Tap to change.') + '">' + GLYPH[st] + '</button>' +
-    '<button type="button" class="item-body" data-act="expand" data-id="' + it.id + '">' +
-    '<span class="item-label">' + esc(it.label) + secBit + '</span>' +
-    qtyBit +
-    '<span class="item-flags">' + flags + '</span>' +
-    '</button></div>';
+    '" aria-label="' + esc(it.label + ': ' + SLABEL[st] + '. Tap to change.') + '">' + GLYPH[st] + '</button>';
+
+  if (ui.editMode) {
+    h += '<input class="field-in item-rename" type="text" data-fld="label" data-id="' + it.id +
+      '" value="' + esc(it.label) + '">';
+  } else {
+    h += '<button type="button" class="item-body" data-act="expand" data-id="' + it.id + '">' +
+      '<span class="item-label">' + esc(it.label) + secBit + '</span>' +
+      qtyBit +
+      '<span class="item-flags">' + flags + '</span>' +
+      '</button>';
+  }
+  h += '</div>';
+
+  if (ui.editMode) {
+    h += editRow('item', it.id, entry.sub.items.indexOf(it), entry.sub.items.length);
+  }
 
   if (open) h += expanderHtml(entry);
   h += '</div>';
@@ -766,6 +1281,43 @@ function viewSettings() {
   var s = stats();
   var h = '';
 
+  h += '<div class="wrap"><div class="eyebrow">Sync</div></div>';
+  h += '<div class="card"><h2>Cross-device sync</h2>';
+  if (!prefs.syncEnabled) {
+    h += '<p>Enter the shop passphrase to sync the checklist and your marks across devices.</p>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<input class="field-in" id="syncPass" type="password" placeholder="Passphrase" style="flex:1 1 160px">' +
+      '<button type="button" class="btn btn-primary" data-act="sync-login">Connect</button></div>';
+  } else {
+    var statusTxt = sync.error ? 'Error: ' + sync.error : sync.syncing ? 'Syncing…' :
+      sync.lastSyncedAt ? 'Last synced ' + new Date(sync.lastSyncedAt).toLocaleString() : 'Not synced yet';
+    h += '<p>' + esc(statusTxt) + '</p>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button type="button" class="btn" data-act="sync-now">Sync now</button>' +
+      '<button type="button" class="btn btn-danger" data-act="sync-logout">Turn off sync</button></div>';
+  }
+  h += '</div>';
+
+  h += '<div class="wrap"><div class="eyebrow">Checklist</div></div>';
+  h += '<div class="card"><h2>Sections</h2>' +
+    '<p>Rename, reorder, or remove a section. Subsections and items are managed from inside each section’s Edit mode.</p>';
+  for (var si = 0; si < seed.sections.length; si++) {
+    var secRow = seed.sections[si];
+    if (secRow.deleted) continue;
+    h += '<div class="switch-row" style="border-top:1px solid var(--line);gap:8px">' +
+      '<input class="field-in" style="flex:1 1 auto" type="text" data-fld="sec-title" data-id="' + secRow.id +
+      '" value="' + esc(secRow.title) + '">' +
+      '<button type="button" class="edit-btn" data-act="sec-move" data-id="' + secRow.id +
+      '" data-dir="-1"' + (si === 0 ? ' disabled' : '') + '>↑</button>' +
+      '<button type="button" class="edit-btn" data-act="sec-move" data-id="' + secRow.id +
+      '" data-dir="1"' + (si === seed.sections.length - 1 ? ' disabled' : '') + '>↓</button>' +
+      '<button type="button" class="edit-btn edit-btn-danger" data-act="sec-delete" data-id="' + secRow.id +
+      '">Delete</button></div>';
+  }
+  h += '<div class="add-row" style="border-top:1px solid var(--line);padding-top:10px">' +
+    '<input class="field-in" id="addSecTitle" type="text" placeholder="New section title…">' +
+    '<button type="button" class="btn" data-act="add-sec">+ Add section</button></div></div>';
+
   h += '<div class="wrap"><div class="eyebrow">Data</div></div>';
   h += '<div class="card"><h2>Back up the audit</h2>' +
     '<p>Everything lives in this browser only. Export after a long session so a cleared cache cannot cost you the work.</p>' +
@@ -844,12 +1396,15 @@ function exportMarkdown() {
 
   for (var i = 0; i < seed.sections.length; i++) {
     var sec = seed.sections[i];
+    if (sec.deleted) continue;
     out.push('## ' + sec.num + '. ' + sec.title, '');
     for (var j = 0; j < sec.subsections.length; j++) {
       var sub = sec.subsections[j];
+      if (sub.deleted) continue;
       out.push('### ' + sub.num + ' ' + sub.title);
       for (var k = 0; k < sub.items.length; k++) {
         var it = sub.items[k];
+        if (it.deleted) continue;
         var st = statusOf(it.id), r = rec(it.id) || {};
         var box = st === 'have' ? 'x' : ' ';
         var line = '- [' + box + '] ' + it.label;
@@ -937,6 +1492,8 @@ function patchItemDom(id) {
   if (btn) {
     btn.setAttribute('data-s', st);
     btn.textContent = GLYPH[st];
+    var label = index[id] && index[id].item.label;
+    if (label) btn.setAttribute('aria-label', label + ': ' + SLABEL[st] + '. Tap to change.');
     btn.classList.add('pulse');
     setTimeout(function () { btn.classList.remove('pulse'); }, 110);
   }
@@ -993,6 +1550,7 @@ function onClick(ev) {
     var d = parseInt(t.getAttribute('data-d'), 10);
     var q = qtyOf(id);
     var nv = Math.max(0, (q === null ? 0 : q) + d);
+    if (nv !== (q === null ? 0 : q)) pushUndo({ kind: 'qty', id: id, prev: q });
     var r = touch(id);
     r.q = nv;
     persist();
@@ -1017,6 +1575,112 @@ function onClick(ev) {
     return;
   }
 
+  if (act === 'edit-toggle') {
+    ui.editMode = !ui.editMode;
+    ui.open = null;
+    var secET = currentSection();
+    if (secET) renderList(secET);
+    return;
+  }
+
+  if (act === 'move') {
+    moveEntity(t.getAttribute('data-kind'), t.getAttribute('data-id'), parseInt(t.getAttribute('data-dir'), 10));
+    var secMV = currentSection();
+    if (secMV) renderList(secMV);
+    return;
+  }
+
+  if (act === 'delete-entity') {
+    var kindDel = t.getAttribute('data-kind');
+    if (!window.confirm('Delete this ' + kindDel + '? Any marks on it stay recorded but it drops off every view.')) return;
+    deleteEntity(kindDel, t.getAttribute('data-id'));
+    if (kindDel === 'section') { location.hash = '#/'; route(); }
+    else { var secDel = currentSection(); if (secDel) renderList(secDel); }
+    paintPlate();
+    return;
+  }
+
+  if (act === 'add-item') {
+    var subId = t.getAttribute('data-sub');
+    var row = t.closest('.add-row');
+    var labelIn = row.querySelector('.add-label');
+    var label = labelIn.value.trim();
+    if (!label) return;
+    var qty = row.querySelector('.add-qty').checked;
+    var target = parseInt(row.querySelector('.add-target').value, 10);
+    var spec = row.querySelector('.add-spec').checked;
+    createItem(subId, { label: label, qty: qty, target: isNaN(target) ? null : target, spec: spec });
+    var secAI = currentSection();
+    if (secAI) renderList(secAI);
+    paintPlate();
+    toast('Added: ' + label);
+    return;
+  }
+
+  if (act === 'add-sub') {
+    var secIdAS = t.getAttribute('data-sec');
+    var rowAS = t.closest('.add-row');
+    var titleIn = rowAS.querySelector('.add-sub-title');
+    var title = titleIn.value.trim();
+    if (!title) return;
+    createSubsection(secIdAS, title);
+    var secAS = currentSection();
+    if (secAS) renderList(secAS);
+    toast('Added subsection: ' + title);
+    return;
+  }
+
+  if (act === 'add-sec') {
+    var titleAC = document.getElementById('addSecTitle');
+    var titleVal = titleAC && titleAC.value.trim();
+    if (!titleVal) return;
+    createSection(titleVal);
+    titleAC.value = '';
+    viewSettings();
+    toast('Added section: ' + titleVal);
+    return;
+  }
+
+  if (act === 'sec-move') {
+    moveEntity('section', t.getAttribute('data-id'), parseInt(t.getAttribute('data-dir'), 10));
+    viewSettings();
+    return;
+  }
+
+  if (act === 'sec-delete') {
+    if (!window.confirm('Delete this section? Any marks on its items stay recorded but it drops off every view.')) return;
+    deleteEntity('section', t.getAttribute('data-id'));
+    viewSettings();
+    paintPlate();
+    return;
+  }
+
+  if (act === 'sync-login') {
+    var passIn = document.getElementById('syncPass');
+    var pass = passIn && passIn.value;
+    if (!pass) return;
+    syncLogin(pass).then(function () {
+      viewSettings();
+      toast('Synced');
+    }, function () {
+      toast('Wrong passphrase');
+    });
+    return;
+  }
+
+  if (act === 'sync-logout') {
+    syncLogout();
+    viewSettings();
+    toast('Sync turned off');
+    return;
+  }
+
+  if (act === 'sync-now') {
+    syncNow();
+    toast('Syncing…');
+    return;
+  }
+
   if (act === 'bulk') {
     var sub = null, sec2 = currentSection();
     if (!sec2) return;
@@ -1031,7 +1695,7 @@ function onClick(ev) {
         changed.push(sub.items[j].id);
       }
     }
-    lastChange = { bulk: changed };
+    if (changed.length) pushUndo({ kind: 'bulk', ids: changed });
     renderList(sec2);
     paintPlate();
     toast('Marked ' + changed.length + ' as Have in ' + sub.num, true);
@@ -1084,7 +1748,8 @@ function onClick(ev) {
   if (act === 'reset') {
     if (!window.confirm('Clear every mark, quantity, note, and cost? This cannot be undone.')) return;
     user = {};
-    lastChange = null;
+    undoStack = [];
+    renderUndoBadge();
     persist();
     location.hash = '#/';
     route();
@@ -1120,7 +1785,8 @@ function onClick(ev) {
 }
 
 function shortLabel(id) {
-  var l = index[id].item.label;
+  var it = findItemAnywhere(id);
+  var l = it ? it.label : id;
   return l.length > 34 ? l.slice(0, 33) + '\u2026' : l;
 }
 
@@ -1139,6 +1805,21 @@ function onInput(ev) {
   }
 
   var fld = el.getAttribute && el.getAttribute('data-fld');
+  if (fld === 'label' || fld === 'sec-title') {
+    var rkind = fld === 'label' ? 'item' : 'section';
+    var rid = el.getAttribute('data-id');
+    var rval = el.value.trim();
+    if (ev.type === 'change') {
+      /* commit: one undo entry per edit session, against the value at focus time */
+      var orig = renameOriginal.get(el);
+      renameOriginal['delete'](el);
+      if (typeof orig === 'string' && orig !== rval) pushUndo({ kind: 'rename', entityKind: rkind, id: rid, prev: orig });
+    } else {
+      /* live-update while typing; no undo entry per keystroke */
+      renameEntity(rkind, rid, rval, false);
+    }
+    return;
+  }
   if (fld) {
     var id = el.getAttribute('data-id');
     var r = touch(id);
@@ -1179,19 +1860,6 @@ function onInput(ev) {
     };
     fr.readAsText(el.files[0]);
   }
-}
-
-function undo() {
-  if (!lastChange) return;
-  if (lastChange.bulk) {
-    for (var i = 0; i < lastChange.bulk.length; i++) setStatus(lastChange.bulk[i], 'unknown', false);
-  } else {
-    setStatus(lastChange.id, lastChange.prev, false);
-  }
-  lastChange = null;
-  hideToast();
-  route();
-  paintPlate();
 }
 
 function applyWakeLock() {
@@ -1235,6 +1903,7 @@ function buildIndex() {
     for (var j = 0; j < sec.subsections.length; j++) {
       var sub = sec.subsections[j];
       for (var k = 0; k < sub.items.length; k++) {
+        if (sub.items[k].deleted) continue;
         var entry = { item: sub.items[k], sec: sec, sub: sub };
         index[sub.items[k].id] = entry;
         flat.push(entry);
@@ -1257,12 +1926,16 @@ function boot() {
     .then(function (saved) {
       if (saved) {
         if (saved.user) user = saved.user;
+        if (saved.seed) { seed = saved.seed; buildIndex(); }
+        if (saved.lastSyncedAt) sync.lastSyncedAt = saved.lastSyncedAt;
         if (saved.prefs) {
           if (saved.prefs.theme) prefs.theme = saved.prefs.theme;
           if (typeof saved.prefs.wake === 'boolean') prefs.wake = saved.prefs.wake;
           if (saved.prefs.group) prefs.group = saved.prefs.group;
+          if (typeof saved.prefs.syncEnabled === 'boolean') prefs.syncEnabled = saved.prefs.syncEnabled;
         }
       }
+      sync.loggedIn = prefs.syncEnabled;
       document.documentElement.setAttribute('data-theme', prefs.theme);
       document.querySelector('meta[name=theme-color]')
         .setAttribute('content', prefs.theme === 'light' ? '#e6e4de' : '#14181b');
@@ -1270,14 +1943,37 @@ function boot() {
       document.getElementById('view').addEventListener('click', onClick);
       document.getElementById('view').addEventListener('input', onInput);
       document.getElementById('view').addEventListener('change', onInput);
-      document.getElementById('toastUndo').addEventListener('click', undo);
+      document.getElementById('view').addEventListener('focusin', function (ev) {
+        var el = ev.target;
+        var fld = el.getAttribute && el.getAttribute('data-fld');
+        if ((fld === 'label' || fld === 'sec-title') && !renameOriginal.has(el)) {
+          renameOriginal.set(el, el.value);
+        }
+      });
+      document.getElementById('toastUndo').addEventListener('click', performUndo);
+      document.getElementById('undoBtn').addEventListener('click', performUndo);
       window.addEventListener('hashchange', route);
+      window.addEventListener('online', function () { if (prefs.syncEnabled) syncNow(); });
+      window.addEventListener('keydown', function (ev) {
+        var meta = ev.ctrlKey || ev.metaKey;
+        if (!meta || ev.key !== 'z' || ev.shiftKey) return;
+        var tag = ev.target && ev.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        ev.preventDefault();
+        performUndo();
+      });
       document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState === 'visible' && prefs.wake) applyWakeLock();
+        if (document.visibilityState === 'visible') {
+          if (prefs.wake) applyWakeLock();
+          if (prefs.syncEnabled) syncNow();
+        }
       });
 
       applyWakeLock();
       route();
+      renderSyncDot();
+      renderUndoBadge();
+      if (prefs.syncEnabled && navigator.onLine !== false) syncNow();
       var boot = document.getElementById('boot');
       if (boot) boot.parentNode.removeChild(boot);
     })

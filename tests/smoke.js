@@ -116,6 +116,8 @@ setTimeout(() => {
   s.dispatchEvent(new w.Event('input', { bubbles: true }));
   setTimeout(() => {
     check('section search filters', qa('.item').length > 0 && qa('.item').length < 60, String(qa('.item').length));
+    s.value = '';
+    s.dispatchEvent(new w.Event('input', { bubbles: true })); // clear it so later section views aren't filtered
 
     // buy view
     w.location.hash = '#/buy';
@@ -169,6 +171,86 @@ setTimeout(() => {
       const beforeUndo = q('#tallyDone').textContent;
       undoBtn.click();
       check('undo reverts', q('#tallyDone').textContent !== beforeUndo, beforeUndo + ' -> ' + q('#tallyDone').textContent);
+
+      // checklist editor: add / rename / move / delete an item
+      w.location.hash = '#/s/s01';
+      w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+      // ui.query is shared with the global search above and is still
+      // "tourniquet"; clear it so the whole section renders. The state
+      // write is synchronous, so the edit-toggle render below picks it up
+      // without waiting on the 140ms search debounce.
+      const s01Search = q('#secSearch');
+      s01Search.value = '';
+      s01Search.dispatchEvent(new w.Event('input', { bubbles: true }));
+      q('[data-act="edit-toggle"]').click();
+      check('edit mode renders rename inputs', qa('.item-rename').length > 0, String(qa('.item-rename').length));
+
+      const addRow = q('.add-row[data-sub]');
+      const subIdForAdd = addRow.getAttribute('data-sub');
+      const beforeAddCount = qa('.item').length;
+      addRow.querySelector('.add-label').value = 'Test widget';
+      q('[data-act="add-item"][data-sub="' + subIdForAdd + '"]').click();
+      check('add item increases count', qa('.item').length === beforeAddCount + 1,
+            beforeAddCount + ' -> ' + qa('.item').length);
+
+      const newRenameIn = qa('.item-rename').find(el => el.value === 'Test widget');
+      const newItemId = newRenameIn && newRenameIn.getAttribute('data-id');
+      check('new item is editable', !!newRenameIn);
+      newRenameIn.dispatchEvent(new w.Event('focusin', { bubbles: true }));
+      newRenameIn.value = 'Renamed widget';
+      newRenameIn.dispatchEvent(new w.Event('input', { bubbles: true }));
+      newRenameIn.dispatchEvent(new w.Event('change', { bubbles: true }));
+      // label edits don't force a re-render (keeps focus); toggle edit mode
+      // off/on to force one and read the label back from the rendered DOM
+      q('[data-act="edit-toggle"]').click();
+      q('[data-act="edit-toggle"]').click();
+      const renamedIn = qa('.item-rename').find(el => el.getAttribute('data-id') === newItemId);
+      check('rename updates label', !!renamedIn && renamedIn.value === 'Renamed widget',
+            renamedIn && renamedIn.value);
+
+      const labelsBeforeMove = qa('.item-rename').map(el => el.value);
+      const posBeforeMove = labelsBeforeMove.indexOf('Renamed widget');
+      const upBtn = qa('.item[data-item="' + newItemId + '"] [data-act="move"][data-dir="-1"]')[0];
+      if (upBtn && !upBtn.disabled) upBtn.click();
+      const labelsAfterMove = qa('.item-rename').map(el => el.value);
+      check('move up shifts item earlier', labelsAfterMove.indexOf('Renamed widget') < posBeforeMove,
+            posBeforeMove + ' -> ' + labelsAfterMove.indexOf('Renamed widget'));
+
+      const beforeDeleteCount = qa('.item').length;
+      qa('.item[data-item="' + newItemId + '"] [data-act="delete-entity"]')[0].click();
+      check('delete removes item from view', qa('.item').length === beforeDeleteCount - 1,
+            beforeDeleteCount + ' -> ' + qa('.item').length);
+      check('deleted item drops out of view', !q('.item[data-item="' + newItemId + '"]'));
+
+      // real multi-level undo: delete then move then delete should each
+      // be independently undoable, in reverse order, via the header button
+      check('undo button visible after edits', !d.getElementById('undoBtn').hidden);
+      const headerUndoBtn = d.getElementById('undoBtn');
+      headerUndoBtn.click(); // undoes the delete
+      check('undo restores deleted item', !!q('.item[data-item="' + newItemId + '"]'));
+      headerUndoBtn.click(); // undoes the move
+      const labelsAfterUndoMove = qa('.item-rename').map(el => el.value);
+      check('undo reverts the move too', labelsAfterUndoMove.indexOf('Renamed widget') === posBeforeMove,
+            String(labelsAfterUndoMove.indexOf('Renamed widget')));
+      headerUndoBtn.click(); // undoes the rename
+      const labelsAfterUndoRename = qa('.item-rename').map(el => el.value);
+      check('undo reverts the rename too', labelsAfterUndoRename.indexOf('Test widget') >= 0,
+            labelsAfterUndoRename.join(', '));
+      headerUndoBtn.click(); // undoes the add
+      check('undo reverts the add too', qa('.item').length === beforeAddCount,
+            beforeAddCount + ' vs ' + qa('.item').length);
+
+      // checklist editor: add a section from Settings
+      w.location.hash = '#/settings';
+      w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+      const secRowsBefore = qa('[data-fld="sec-title"]').length;
+      d.getElementById('addSecTitle').value = 'Test Section';
+      q('[data-act="add-sec"]').click();
+      check('add section increases section list', qa('[data-fld="sec-title"]').length === secRowsBefore + 1,
+            secRowsBefore + ' -> ' + qa('[data-fld="sec-title"]').length);
+      w.location.hash = '#/';
+      w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+      check('new section appears on index', qa('.sec-row').length === 20, String(qa('.sec-row').length));
 
       console.log(log.join('\n'));
       console.log('\nerrors captured: ' + errors.length);

@@ -1,5 +1,8 @@
 /* Cache-first app shell so the audit works with no signal in the garage. */
-var CACHE = 'shop-inv-v1';
+/* Bump on every shipped change to index.html / app.js / styles.css, or
+   returning devices keep booting the previous shell from cache.
+   v2: sync UI, checklist editor, multi-level undo. */
+var CACHE = 'shop-inv-v2';
 var CORE = [
   './',
   'index.html',

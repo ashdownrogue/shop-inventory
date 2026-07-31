@@ -1,0 +1,13 @@
+# Keep dev-only files out of the deployment. Anything left in the repo root
+# is both uploaded and publicly served, so this is also what stops the test
+# suite and planning docs from being fetchable on the live site.
+#
+# Do NOT add lib/ here -- api/*.js imports it at runtime.
+# Do NOT add data/ or icons/ -- the app fetches those in the browser.
+
+tests/
+scripts/
+db/
+.claude/
+CLAUDE.md
+SYNC_AND_EDITOR_PLAN.md

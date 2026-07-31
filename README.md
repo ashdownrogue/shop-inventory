@@ -1,7 +1,10 @@
 # Shop Inventory
 
 A local-first, offline-capable audit app for the 1,534-item garage shop checklist.
-No build step, no backend, no dependencies. Static files only.
+No build step for the frontend — static files, works with zero setup. An
+optional Postgres-backed sync API (a handful of serverless functions under
+`/api`) can be turned on later for in-app checklist editing and cross-device
+sync; see [Cross-device sync](#cross-device-sync).
 
 ## Deploy to Vercel
 
@@ -23,7 +26,8 @@ gh repo create shop-inventory --private --source=. --push
 ```
 Then import the repo at vercel.com/new.
 
-There is nothing to configure: no environment variables, no database, no secrets.
+Nothing to configure for the base app: no environment variables, no database,
+no secrets. See [Cross-device sync](#cross-device-sync) if you want that.
 
 ## Run locally
 
@@ -42,12 +46,22 @@ registers a service worker. Any static server is fine.
 - Item IDs are derived from content (`section-subsection-slug`), so you can edit,
   reorder, or insert checklist lines and your existing marks stay attached.
 - Marks live in IndexedDB on the device, with a localStorage fallback. Nothing
-  leaves the browser.
+  leaves the browser unless you turn on sync (below).
 - The service worker caches the shell, so it works with no signal.
 
 ## Editing the checklist
 
-Edit `data/checklist.md` and redeploy. The parser reads:
+**In the app** (once [sync](#cross-device-sync) is set up): open a section,
+tap **Edit** in the toolbar to rename, reorder, or delete subsections and
+items, add new ones with the "+ Add item" / "+ Add subsection" forms, or
+go to Settings → Checklist to rename/reorder/delete a whole section. Every
+change syncs to the database and to every other signed-in device — no
+redeploy needed. This is the everyday path once sync is set up.
+
+**By hand**, still supported: edit `data/checklist.md` and redeploy. This
+is the only path if you haven't set up sync, and it's still how the
+database itself gets its starting content (`scripts/seed-db.js`, once).
+The parser reads:
 
 | Markdown | Becomes |
 |---|---|
@@ -83,31 +97,84 @@ Tap the left block to cycle. Tap the item name to open quantity, spec, note, and
 ```
 index.html              app shell
 styles.css              design tokens and all styling
-app.js                  parser, state, IndexedDB, views, exports
-data/checklist.md       the canonical checklist (parsed at runtime)
+app.js                  parser, state, editor, sync client, IndexedDB, views, exports
+data/checklist.md       the factory-default checklist (parsed at runtime, pre-sync)
 manifest.webmanifest    PWA manifest
 sw.js                   service worker, cache-first shell
 vercel.json             cache headers
 icons/                  app icons
+api/auth/login.js       passphrase check, issues the session cookie
+api/auth/logout.js      clears the session cookie
+api/sync.js             POST /api/sync: push/pull checklist + marks, last-write-wins
+lib/auth.js             passphrase hashing + signed-cookie session helpers
+lib/db.js               shared Postgres client + upsert/query helpers
+db/schema.sql           sections/subsections/items/marks tables
+scripts/seed-db.js      one-time: loads data/checklist.md into Postgres with frozen ids
 scripts/parse_checklist.py   optional: reference parser, for inspecting the data
 scripts/make_icons.py        regenerates the icons
-tests/smoke.js          headless test suite, 31 checks
+tests/smoke.js          headless test suite
 ```
 
 ## Tests
 
 ```bash
-npm install jsdom
-node tests/smoke.js
+npm install
+npm test
 ```
 
 Covers status cycling, bulk marking, filters, search, the expander, quantity
 steppers, the buy list and its grouping, cost totals, exports, theme, undo, and
 the rule that an uncounted consumable never appears on the buy list.
 
-## Adding cross-device sync later
+## Cross-device sync
 
-The data model already carries `updatedAt` per item for this purpose. The additive
-path: a `/api/sync` route handler, a Postgres or Turso table mirroring the local
-shape, item-level last-write-wins on `updatedAt`, and a passphrase in an env var
-behind middleware. No migration of existing marks required.
+Optional. Turns on in-app checklist editing (add/rename/reorder/delete
+sections, subsections, and items — no more hand-editing markdown) plus
+syncing everything, checklist and marks, across every device signed in
+with the same passphrase.
+
+**1. Attach a Postgres database.** In the Vercel dashboard, open the
+project → **Storage** → **Marketplace**, and add **Neon**. It sets
+`DATABASE_URL` (among others) on the project automatically.
+
+> "Vercel Postgres" no longer exists as a separate product — it became the
+> Neon integration in December 2024, and the old `@vercel/postgres` SDK is
+> deprecated. This project uses Neon's own driver
+> (`@neondatabase/serverless`) and reads `DATABASE_URL`.
+
+**2. Apply the schema.** Run [`db/schema.sql`](db/schema.sql) against that
+database once — either from the SQL editor in the Neon console, or:
+
+```bash
+psql "$DATABASE_URL" -f db/schema.sql
+```
+
+**3. Set the two auth env vars**, in the Vercel dashboard:
+
+- `SHOP_PASSPHRASE_HASH` — generate with:
+  ```bash
+  node -e "const c=require('crypto'),s=c.randomBytes(16).toString('hex');
+  console.log(s+':'+c.scryptSync(process.argv[1],s,64).toString('hex'))" 'your passphrase here'
+  ```
+  Set the env var to the printed `salt:hash` string — not the raw passphrase.
+- `SESSION_SECRET` — any long random string (e.g. `openssl rand -hex 32`).
+
+**4. Seed the database once**, with `DATABASE_URL` set locally
+(`vercel env pull` writes a `.env.local` you can source, or paste the
+connection string from the Neon console):
+
+```bash
+npm install
+DATABASE_URL="postgres://..." npm run seed-db
+```
+
+This parses `data/checklist.md` with the exact same logic the app uses in
+the browser and inserts it with those content-derived ids frozen in
+place — so marks any device has already recorded locally still line up
+the first time it syncs.
+
+**5. Deploy**, then open the app → Settings → enter the passphrase → Connect.
+
+Everything still works fully offline with sync off — this is additive,
+not required. Conflicts resolve last-write-wins per item on `updatedAt`,
+the same rule the JSON import/export already used.
